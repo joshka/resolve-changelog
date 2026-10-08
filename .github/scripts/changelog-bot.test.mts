@@ -1,4 +1,7 @@
 import { test } from 'node:test';
+import { readFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import runBot, { planMerge, type BotServices, type TreeEntry } from './changelog-bot.mts';
 
@@ -12,8 +15,8 @@ interface Call {
 interface MockPull {
   number?: number;
   state?: string;
-  head?: { sha?: string; ref?: string; repo?: { full_name: string } };
-  base?: { sha?: string; ref?: string; repo?: { full_name: string } };
+  head?: { sha?: string; ref?: string; repo?: { full_name: string; id?: number; owner?: { login: string }; name?: string } };
+  base?: { sha?: string; ref?: string; repo?: { full_name: string; id?: number; owner?: { login: string }; name?: string } };
 }
 
 interface Options {
@@ -54,8 +57,8 @@ function harness(options: Options = {}): BotServices & { calls: Call[] } {
   const pull = {
     number: 42,
     state: 'open',
-    head: { sha: 'head', ref: 'topic', repo: { full_name: 'owner/repo' } },
-    base: { sha: 'target', ref: 'main', repo: { full_name: 'owner/repo' } },
+    head: { sha: 'head', ref: 'topic', repo: { full_name: 'owner/repo', id: 1, owner: { login: 'owner' }, name: 'repo' } },
+    base: { sha: 'target', ref: 'main', repo: { full_name: 'owner/repo', id: 1, owner: { login: 'owner' }, name: 'repo' } },
     ...options.pull,
   };
   let pullReads = 0;
@@ -170,15 +173,27 @@ test('already synchronized PRs are unchanged', async () => {
   assert.ok(!bot.calls.some(call => call.name === 'createTree'));
 });
 
-test('fork PRs are refused before creating objects', async () => {
-  const bot = harness({ pull: {
-    number: 42, state: 'open',
-    head: { repo: { full_name: 'contributor/fork' } },
-    base: { repo: { full_name: 'owner/repo' } },
-  } });
-  await runBot(bot);
-  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'refused');
-  assert.ok(!bot.calls.some(call => call.name === 'createTree'));
+test('forks without a writer produce an artifact without creating remote objects', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'changelog-fork-'));
+  const previousDirectory = process.cwd();
+  try {
+    process.chdir(directory);
+    const bot = harness({ pull: {
+      number: 42, state: 'open',
+      head: { sha: 'head', ref: 'topic', repo: { full_name: 'contributor/fork',
+        id: 2, owner: { login: 'contributor' }, name: 'fork' } },
+      base: { sha: 'target', ref: 'main', repo: { full_name: 'owner/repo' } },
+    } });
+    await runBot(bot);
+    assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'prepared');
+    assert.ok(!bot.calls.some(call => call.name === 'createTree'));
+    const resolved = readFileSync('resolved-CHANGELOG.md', 'utf8');
+    assert.ok(resolved.includes('* PR fix.'));
+    assert.ok(resolved.includes('* Main fix.'));
+  } finally {
+    process.chdir(previousDirectory);
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('truncated trees and unsupported entries never publish', async () => {
@@ -215,7 +230,7 @@ test('publication errors are not retried or reported as success', async () => {
 
 test('base branch refs override stale PR payload SHAs', async () => {
   const bot = harness({ pull: {
-    base: { sha: 'old-target', ref: 'main', repo: { full_name: 'owner/repo' } },
+    base: { sha: 'old-target', ref: 'main', repo: { full_name: 'owner/repo', id: 1, owner: { login: 'owner' }, name: 'repo' } },
   } });
   await runBot(bot);
   assert.equal(bot.calls.find(call => call.name === 'compare')!.args!.basehead, 'target...head');
@@ -225,6 +240,44 @@ test('base branch refs override stale PR payload SHAs', async () => {
 
 test('a concurrent base branch update prevents publication', async () => {
   const bot = harness({ currentBase: 'new-target' });
+  await runBot(bot);
+  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'refused');
+  assert.ok(!bot.calls.some(call => call.name === 'updateRef'));
+});
+
+test('fork publication uses only the matching fork writer', async () => {
+  const forkHead = { sha: 'head', ref: 'topic', repo: { full_name: 'contributor/fork',
+    id: 2, owner: { login: 'contributor' }, name: 'fork' } };
+  const bot = harness({ pull: { head: forkHead }, currentPull: {
+    state: 'open', head: forkHead, base: { sha: 'target', ref: 'main' },
+  } });
+  const writer = harness();
+  bot.writer = { repository: 'contributor/fork', github: writer.github };
+  await runBot(bot);
+  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'resolved');
+  assert.ok(!bot.calls.some(call => call.name === 'createTree' || call.name === 'updateRef'));
+  for (const name of ['getCommit', 'createTree', 'createCommit', 'updateRef']) {
+    const args = writer.calls.find(call => call.name === name)!.args!;
+    assert.equal(args.owner, 'contributor');
+    assert.equal(args.repo, 'fork');
+  }
+});
+
+test('a writer for another repository cannot publish', async () => {
+  const bot = harness();
+  const writer = harness();
+  bot.writer = { repository: 'unrelated/repo', github: writer.github };
+  await runBot(bot);
+  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'refused');
+  assert.deepEqual(writer.calls, []);
+});
+
+test('a changed head repository prevents branch publication', async () => {
+  const bot = harness({ currentPull: {
+    state: 'open',
+    head: { sha: 'head', ref: 'topic', repo: { full_name: 'other/repo', id: 99 } },
+    base: { sha: 'target', ref: 'main' },
+  } });
   await runBot(bot);
   assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'refused');
   assert.ok(!bot.calls.some(call => call.name === 'updateRef'));

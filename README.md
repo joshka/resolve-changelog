@@ -5,7 +5,8 @@ contributors to a changelog-fragment workflow.
 
 A maintainer comments `/resolve-changelog` on a pull request. The bot combines complete bullet
 insertions under existing Unreleased subsections and merges the base branch into the PR branch.
-It uses GitHub APIs through `actions/github-script`; it does not execute code from the PR.
+It explicitly checks out upstream `main` and uses GitHub APIs through `actions/github-script`.
+PR and fork files are read as data; their code is never executed by the bot.
 
 ## Run checks
 
@@ -40,9 +41,37 @@ outside `CHANGELOG.md`, edits or deletions of existing changelog entries, headin
 updates, truncated API trees, and a PR that moves during resolution. It updates the PR branch
 without force-pushing and leaves final merging to the maintainer.
 
+## Forks and first-time contributors
+
+Anyone can submit a PR. A contributor or maintainer with upstream write access authorizes resolution
+by posting `/resolve-changelog`; the PR author does not need upstream write access.
+
+Without fork write credentials, the bot prepares a `resolved-changelog-<PR>` artifact containing
+`resolved-CHANGELOG.md`. Its reply links the workflow run and records the exact head and base SHAs.
+The author merges that captured base into the PR branch, replaces the conflicted `CHANGELOG.md`
+with the downloaded file, then publishes the merge. If either branch has since changed, request
+another resolution instead of applying an outdated file.
+
+To allow automatic publication, register a GitHub App with **Contents: write** and install it on
+selected repositories, including each fork that opts in. Configure these on the upstream repo:
+
+- Repository variable `CHANGELOG_APP_CLIENT_ID`: the App's client ID.
+- Repository secret `CHANGELOG_APP_PRIVATE_KEY`: the App's private key.
+
+The workflow first checks the caller's upstream permissions. Only then does it request a short-lived
+writer token restricted to the PR head repository and Contents permission. That token handles
+publication only; the upstream `GITHUB_TOKEN` handles reading and replying to the PR. The token is
+revoked when the job ends. A missing fork installation falls back to the downloadable resolution.
+
+The bot checks that the writer targets the captured head repository, rechecks branch SHAs and the
+head repository ID before publishing, and never force-pushes. An App token also lets normal PR CI
+trigger without the `GITHUB_TOKEN` approval interruption. Fork PR CI still follows GitHub's normal
+fork approval policies.
+
 ## Current limitations
 
-- Only same-repository PRs are supported. Fork branches need separate write credentials.
+- Fork publication requires an authorized GitHub App installation. Without it, the bot supplies
+  a downloadable resolution and leaves the branch untouched.
 - Resolution creates a merge commit; it does not rebase the contributor's commits.
 - Invocation is manual. Conflict status does not have its own GitHub Actions event.
 - The default workflow uses `GITHUB_TOKEN`. PR workflows triggered by its update may require

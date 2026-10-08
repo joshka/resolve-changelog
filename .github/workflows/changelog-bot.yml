@@ -18,14 +18,58 @@ jobs:
       github.event.issue.pull_request &&
       github.event.comment.body == '/resolve-changelog'
     runs-on: ubuntu-26.04
+    env:
+      APP_CONFIGURED: ${{ vars.CHANGELOG_APP_CLIENT_ID != '' && secrets.CHANGELOG_APP_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          repository: ${{ github.repository }}
+          ref: main
           persist-credentials: false
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      - name: Authorize the request on upstream
+        id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { pathToFileURL } = await import('node:url');
+            const script = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/changelog-bot.mts`);
+            const { authorizeRequest } = await import(script.href);
+            const pull = await authorizeRequest({ github, context, core });
+            if (!pull) return null;
+            return { owner: pull.head.repo.owner.login, repo: pull.head.repo.name,
+              fullName: pull.head.repo.full_name };
+      - name: Request a writer for the exact head repository
+        id: writer
+        if: steps.request.outputs.result != 'null' && env.APP_CONFIGURED == 'true'
+        continue-on-error: true # A fork without an App installation gets a downloadable resolution.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CHANGELOG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHANGELOG_APP_PRIVATE_KEY }}
+          owner: ${{ fromJSON(steps.request.outputs.result).owner }}
+          repositories: ${{ fromJSON(steps.request.outputs.result).repo }}
+          permission-contents: write
+      - name: Resolve using trusted main code
+        id: resolve
+        if: steps.request.outputs.result != 'null'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          WRITER_TOKEN: ${{ steps.writer.outputs.token }}
+          WRITER_REPOSITORY: ${{ fromJSON(steps.request.outputs.result).fullName }}
         with:
           script: |
             const { pathToFileURL } = await import('node:url');
             const script = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/changelog-bot.mts`);
             const { default: runBot } = await import(script.href);
-            await runBot({ github, context, core });
+            const writer = process.env.WRITER_TOKEN
+              ? { repository: process.env.WRITER_REPOSITORY, github: getOctokit(process.env.WRITER_TOKEN) }
+              : undefined;
+            await runBot({ github, context, core, writer });
+      - name: Upload a resolution for a fork without write access
+        if: steps.resolve.outputs.result == 'prepared'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: resolved-changelog-${{ github.event.issue.number }}
+          path: resolved-CHANGELOG.md
+          if-no-files-found: error
+          retention-days: 7

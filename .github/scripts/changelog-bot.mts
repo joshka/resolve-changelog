@@ -1,3 +1,4 @@
+import { writeFileSync } from 'node:fs';
 import type { getOctokit } from '@actions/github';
 import type * as ActionsCore from '@actions/core';
 import { ManualResolutionRequired, resolve } from './resolve-changelog.mts';
@@ -29,6 +30,7 @@ interface MergePlan {
 
 export interface BotServices {
   github: GitHub;
+  writer?: { repository: string; github: GitHub };
   core: typeof ActionsCore;
   context: {
     repo: Repository;
@@ -147,30 +149,35 @@ async function prepareMerge(github: GitHub, repository: Repository, pull: PullRe
   return plan;
 }
 
-async function publishMerge(github: GitHub, repository: Repository, pull: PullRequest, plan: MergePlan): Promise<string> {
-  const { data: headCommit } = await github.rest.git.getCommit({
+async function publishMerge(services: BotServices, pull: PullRequest, plan: MergePlan): Promise<string> {
+  const { github, context, writer } = services;
+  const headRepository = pull.head.repo;
+  if (!headRepository) refuse('The PR head repository is no longer available.');
+  const repository = { owner: headRepository.owner.login, repo: headRepository.name };
+  const publisher = writer?.github ?? github;
+  const { data: headCommit } = await publisher.rest.git.getCommit({
     ...repository, commit_sha: pull.head.sha,
   });
-  const { data: tree } = await github.rest.git.createTree({
+  const { data: tree } = await publisher.rest.git.createTree({
     ...repository, base_tree: headCommit.tree.sha, tree: plan.updates,
   });
-  const { data: commit } = await github.rest.git.createCommit({
+  const { data: commit } = await publisher.rest.git.createCommit({
     ...repository,
     message: `changelog: Merge ${pull.base.ref} and resolve entries`,
     tree: tree.sha,
     parents: [pull.head.sha, pull.base.sha],
   });
 
-  const current = await loadPull(github, repository, pull.number);
+  const current = await loadPull(github, context.repo, pull.number);
   if (current.state !== 'open' || current.head.sha !== pull.head.sha ||
       current.base.sha !== pull.base.sha || current.head.ref !== pull.head.ref ||
-      current.base.ref !== pull.base.ref) {
+      current.base.ref !== pull.base.ref || current.head.repo?.id !== pull.head.repo?.id) {
     refuse('The PR changed while resolving; invoke the bot again.');
   }
 
   // No force push: a concurrent new commit makes this update fail rather than
   // losing the contributor work. This merge preserves both captured parents.
-  await github.rest.git.updateRef({
+  await publisher.rest.git.updateRef({
     ...repository, ref: `heads/${pull.head.ref}`, sha: commit.sha, force: false,
   });
   return commit.sha;
@@ -188,12 +195,12 @@ async function finish({ github, context, core }: BotServices, issueNumber: numbe
   });
 }
 
-/** Entry point for actions/github-script; it supplies all GitHub dependencies. */
-export default async function runBot(services: BotServices) {
+/** Check upstream authorization before requesting any fork credentials. */
+export async function authorizeRequest(services: BotServices) {
   const { github, context, core } = services;
   const { issue, comment } = context.payload;
-  if (!issue?.pull_request || comment?.body?.trim() !== COMMAND) return;
-  if (comment.user.type === 'Bot') return;
+  if (!issue?.pull_request || comment?.body?.trim() !== COMMAND) return null;
+  if (comment.user.type === 'Bot') return null;
 
   const repository = context.repo;
   const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -201,25 +208,50 @@ export default async function runBot(services: BotServices) {
   });
   if (!['write', 'maintain', 'admin'].includes(permission.permission)) {
     core.notice('Changelog resolution requires repository write access.');
-    return;
+    return null;
   }
 
   const pull = await loadPull(github, repository, issue.number);
+  if (pull.state !== 'open' || !pull.head.repo) return null;
+  return pull;
+}
+
+/** All repository reads use the upstream token; only publication uses a writer. */
+export default async function runBot(services: BotServices) {
+  const { github, context, core, writer } = services;
+  const pull = await authorizeRequest(services);
+  if (!pull) return;
+  const repository = context.repo;
+  const isFork = pull.head.repo?.full_name !== pull.base.repo.full_name;
+
   try {
     if (pull.state !== 'open') refuse('The PR is no longer open.');
-    if (pull.head.repo?.full_name !== pull.base.repo.full_name) {
-      refuse('This workflow supports same-repository PR branches; fork branches need separate write credentials.');
+    if (writer && writer.repository !== pull.head.repo?.full_name) {
+      refuse('The writer token does not target this PR head repository.');
     }
     const plan = await prepareMerge(github, repository, pull);
     if (!plan) {
-      await finish(services, issue.number, 'unchanged', 'The PR already contains the current base branch.');
+      await finish(services, pull.number, 'unchanged', 'The PR already contains the current base branch.');
       return;
     }
-    const sha = await publishMerge(github, repository, pull, plan);
-    await finish(services, issue.number, 'resolved', `Updated the PR with merge commit ${sha}. Check the required CI runs before merging.`);
+    if (isFork && !writer) {
+      const changelog = plan.updates.find(update => update.path === CHANGELOG)?.content;
+      if (changelog === undefined) {
+        refuse('This fork needs a normal branch merge; the bot has no authorized writer for it.');
+      }
+      writeFileSync('resolved-CHANGELOG.md', changelog);
+      const runUrl = `${process.env.GITHUB_SERVER_URL ?? 'https://github.com'}/${repository.owner}/${repository.repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+      await finish(services, pull.number, 'prepared',
+        `Prepared the resolved changelog for head ${pull.head.sha} and base ${pull.base.sha}. ` +
+        `Download the resolution artifact from ${runUrl}. Merge the captured base into your branch, ` +
+        'replace CHANGELOG.md with the downloaded file, and publish the result. The fork branch was not changed.');
+      return;
+    }
+    const sha = await publishMerge(services, pull, plan);
+    await finish(services, pull.number, 'resolved', `Updated the PR with merge commit ${sha}. Check the required CI runs before merging.`);
   } catch (error) {
     if (error instanceof ManualResolutionRequired) {
-      await finish(services, issue.number, 'refused', error.message);
+      await finish(services, pull.number, 'refused', error.message);
     } else {
       // Do not retry mutations or report successful publication as a refusal.
       core.setOutput('result', 'error');
