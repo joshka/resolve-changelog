@@ -6,6 +6,8 @@
 
 * Add a sample feature for conflict experiments.
 
+* Add the main-side experiment entry.
+
 ### Fixed bugs
 
 ## [0.1.0] - 2026-10-07
