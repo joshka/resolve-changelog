@@ -1,0 +1,31 @@
+name: Resolve changelog
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: changelog-bot-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/resolve-changelog'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { pathToFileURL } = await import('node:url');
+            const script = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/changelog-bot.mts`);
+            const { default: runBot } = await import(script.href);
+            await runBot({ github, context, core });
