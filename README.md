@@ -9,7 +9,8 @@ It uses GitHub APIs through `actions/github-script`; it does not execute code fr
 
 ## Run checks
 
-Use Node 24 or newer. TypeScript runs directly, without a compilation step.
+Use the current stable Node release for development. TypeScript runs directly, without a
+compilation step. CI checks both current Node and Node 24, the GitHub Script runtime.
 
 ```sh
 npm ci
@@ -56,4 +57,4 @@ without force-pushing and leaves final merging to the maintainer.
 - `.github/scripts/changelog-bot.mts`: authorization, merge planning, publication, and reporting.
 - `.github/scripts/*.test.mts`: resolver and mocked API tests.
 - `.github/workflows/changelog-bot.yml`: comment-triggered bot.
-- `.github/workflows/ci.yml`: Node 24 tests and strict type checking.
+- `.github/workflows/ci.yml`: current Node and Node 24 tests, plus strict type checking.
