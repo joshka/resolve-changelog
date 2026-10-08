@@ -107,6 +107,15 @@ async function loadText(github: GitHub, repository: Repository, entry: TreeEntry
   return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
+async function loadPull(github: GitHub, repository: Repository, number: number): Promise<PullRequest> {
+  const { data: pull } = await github.rest.pulls.get({ ...repository, pull_number: number });
+  // The PR payload can retain its original base SHA after the branch advances.
+  const { data: baseRef } = await github.rest.git.getRef({
+    ...repository, ref: `heads/${pull.base.ref}`,
+  });
+  return { ...pull, base: { ...pull.base, sha: baseRef.object.sha } };
+}
+
 async function prepareMerge(github: GitHub, repository: Repository, pull: PullRequest): Promise<MergePlan | null> {
   const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
     ...repository,
@@ -152,7 +161,7 @@ async function publishMerge(github: GitHub, repository: Repository, pull: PullRe
     parents: [pull.head.sha, pull.base.sha],
   });
 
-  const { data: current } = await github.rest.pulls.get({ ...repository, pull_number: pull.number });
+  const current = await loadPull(github, repository, pull.number);
   if (current.state !== 'open' || current.head.sha !== pull.head.sha ||
       current.base.sha !== pull.base.sha || current.head.ref !== pull.head.ref ||
       current.base.ref !== pull.base.ref) {
@@ -195,7 +204,7 @@ export default async function runBot(services: BotServices) {
     return;
   }
 
-  const { data: pull } = await github.rest.pulls.get({ ...repository, pull_number: issue.number });
+  const pull = await loadPull(github, repository, issue.number);
   try {
     if (pull.state !== 'open') refuse('The PR is no longer open.');
     if (pull.head.repo?.full_name !== pull.base.repo.full_name) {
