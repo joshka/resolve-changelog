@@ -25,6 +25,7 @@ interface Options {
   ancestor?: string;
   truncated?: boolean;
   pushFails?: boolean;
+  currentBase?: string;
 }
 
 function blob(path: string, sha: string): TreeEntry {
@@ -58,6 +59,7 @@ function harness(options: Options = {}): BotServices & { calls: Call[] } {
     ...options.pull,
   };
   let pullReads = 0;
+  let baseReads = 0;
   const endpoint = (name: string, implementation: (args: Record<string, unknown>) => unknown) => async (args: Record<string, unknown>) => {
     calls.push({ name, args });
     return { data: implementation(args) };
@@ -74,6 +76,7 @@ function harness(options: Options = {}): BotServices & { calls: Call[] } {
       }),
     },
     git: {
+      getRef: endpoint('getRef', () => ({ object: { sha: ++baseReads === 1 ? 'target' : (options.currentBase ?? 'target') } })),
       getTree: endpoint('getTree', args => ({ tree: files[String(args.tree_sha)], truncated: options.truncated ?? false })),
       getBlob: endpoint('getBlob', args => ({ content: Buffer.from(contents[String(args.file_sha)]).toString('base64'), encoding: 'base64' })),
       getCommit: endpoint('getCommit', () => ({ tree: { sha: 'head-tree' } })),
@@ -208,4 +211,21 @@ test('publication errors are not retried or reported as success', async () => {
   assert.equal(bot.calls.filter(call => call.name === 'updateRef').length, 1);
   assert.ok(bot.calls.some(call => call.name === 'failed'));
   assert.ok(!bot.calls.some(call => call.name === 'comment'));
+});
+
+test('base branch refs override stale PR payload SHAs', async () => {
+  const bot = harness({ pull: {
+    base: { sha: 'old-target', ref: 'main', repo: { full_name: 'owner/repo' } },
+  } });
+  await runBot(bot);
+  assert.equal(bot.calls.find(call => call.name === 'compare')!.args!.basehead, 'target...head');
+  assert.deepEqual(bot.calls.find(call => call.name === 'createCommit')!.args!.parents, ['head', 'target']);
+  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'resolved');
+});
+
+test('a concurrent base branch update prevents publication', async () => {
+  const bot = harness({ currentBase: 'new-target' });
+  await runBot(bot);
+  assert.equal(bot.calls.find(call => call.name === 'output')!.value, 'refused');
+  assert.ok(!bot.calls.some(call => call.name === 'updateRef'));
 });
